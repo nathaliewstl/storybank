@@ -1,449 +1,345 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { BookOpen, Mic, Plus, Tag as TagIcon } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { friendlyError } from "@/lib/errors";
+import {
+  hasTag,
+  normalizeStory,
+  type AiErrorCode,
+  type CvDocument,
+  type Story,
+  type Suggestion,
+  type Tag,
+} from "@/lib/types";
+import { isToday, isTooShort, starProgress, type StarDraft } from "@/lib/star";
+import PrivacyNote from "./PrivacyNote";
+import GettingStarted from "./app/GettingStarted";
+import StatsBar from "./app/StatsBar";
+import SectionHeader from "./app/SectionHeader";
+import NewStory, { type NewStoryOption } from "./app/NewStory";
+import StoryGallery, { type StoryView } from "./app/StoryGallery";
+import PracticePanel from "./app/PracticePanel";
+import TagPanel from "./app/TagPanel";
+import { TagColorProvider, buildTagColors } from "@/lib/tagColors";
 
-export type Story = {
-  id: string;
-  user_id: string;
-  description: string;
-  situation: string;
-  task: string;
-  action: string;
-  result: string;
-  tags: string[];
-  practice_count: number;
-  last_practiced_at: string | null;
-  created_at: string;
-};
-
-type Draft = Pick<Story, "description" | "situation" | "task" | "action" | "result"> & {
-  tagsText: string;
-};
-
-const EMPTY_DRAFT: Draft = {
-  description: "",
-  situation: "",
-  task: "",
-  action: "",
-  result: "",
-  tagsText: "",
-};
-
-const STAR_FIELDS = [
-  { key: "situation", label: "Situation", hint: "Where were you, and what was the context?" },
-  { key: "task", label: "Task", hint: "What were you responsible for?" },
-  { key: "action", label: "Action", hint: "What did you do, specifically?" },
-  { key: "result", label: "Result", hint: "What happened? Use numbers if you can." },
-] as const;
-
-function parseTags(text: string): string[] {
-  const tags = text
-    .split(",")
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-  return Array.from(new Set(tags));
-}
-
-function isToday(iso: string | null) {
-  if (!iso) return false;
-  return new Date(iso).toDateString() === new Date().toDateString();
-}
-
-function starProgress(s: Story) {
-  return STAR_FIELDS.filter((f) => s[f.key].trim() !== "").length;
-}
+// The browser stops waiting for the AI after this long and shows a friendly retry message
+const AI_TIMEOUT_MS = 45_000;
 
 export default function StoryBoard({
+  userId,
   initialStories,
+  initialTags,
+  initialCv,
+  initialSuggestions,
+  initialPracticeLog,
   loadError,
 }: {
+  userId: string;
   initialStories: Story[];
+  initialTags: Tag[];
+  initialCv: CvDocument | null;
+  initialSuggestions: Suggestion[];
+  initialPracticeLog: string[];
   loadError: string | null;
 }) {
   const supabase = useMemo(() => createClient(), []);
-  const [stories, setStories] = useState<Story[]>(initialStories);
-  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
-  const [showDetails, setShowDetails] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(loadError);
-  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const [stories, setStories] = useState<Story[]>(() => initialStories.map(normalizeStory));
+  const [tags, setTags] = useState<Tag[]>(initialTags);
+  const [structuring, setStructuring] = useState<Record<string, boolean>>({});
+  const [aiErrors, setAiErrors] = useState<Record<string, AiErrorCode | undefined>>({});
+  const [newId, setNewId] = useState<string | null>(null);
+  const [practiceId, setPracticeId] = useState<string | null>(null);
+  const [newOption, setNewOption] = useState<NewStoryOption>("write");
+  const [view, setView] = useState<StoryView>("tag");
+  const [practiceLog, setPracticeLog] = useState<string[]>(initialPracticeLog);
 
-  const allTags = useMemo(
-    () => Array.from(new Set(stories.flatMap((s) => s.tags))).sort(),
-    [stories]
-  );
-  const visible = tagFilter ? stories.filter((s) => s.tags.includes(tagFilter)) : stories;
+  const tagNames = tags.map((t) => t.name);
+  const tagColors = useMemo(() => buildTagColors(tags), [tags]);
+  const tagCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const t of tags) counts[t.name] = stories.filter((s) => hasTag(s.tags, t.name)).length;
+    return counts;
+  }, [tags, stories]);
+  const emptyTagCount = tags.filter((t) => tagCounts[t.name] === 0).length;
+  const readyCount = stories.filter((s) => starProgress(s) === 4).length;
+  const practisedTotal = stories.reduce((n, s) => n + s.practice_count, 0);
+  const practisedToday = stories.some((s) => isToday(s.last_practiced_at)) || practiceLog.some((t) => isToday(t));
 
-  const practicedToday = stories.some((s) => isToday(s.last_practiced_at));
-  const nextToPractice = useMemo(() => {
-    return [...stories].sort((a, b) => {
-      const at = a.last_practiced_at ? Date.parse(a.last_practiced_at) : 0;
-      const bt = b.last_practiced_at ? Date.parse(b.last_practiced_at) : 0;
-      return at - bt || Date.parse(a.created_at) - Date.parse(b.created_at);
-    })[0];
-  }, [stories]);
-
-  async function addStory(e: React.FormEvent) {
-    e.preventDefault();
-    const description = draft.description.trim();
-    if (!description) return;
-    setSaving(true);
-    setError(null);
-
-    const { data, error } = await supabase
-      .from("stories")
-      .insert({
-        description,
-        situation: draft.situation.trim(),
-        task: draft.task.trim(),
-        action: draft.action.trim(),
-        result: draft.result.trim(),
-        tags: parseTags(draft.tagsText),
-      })
-      .select()
-      .single();
-
-    setSaving(false);
-    if (error) {
-      setError(error.message);
-      return;
+  // Streak = consecutive days (in the user's time zone) with at least one practice, ending today or yesterday
+  const streak = useMemo(() => {
+    const days = new Set([...practiceLog, ...stories.map((s) => s.last_practiced_at).filter(Boolean) as string[]]
+      .map((t) => new Date(t).toDateString()));
+    const d = new Date();
+    if (!days.has(d.toDateString())) d.setDate(d.getDate() - 1);
+    let n = 0;
+    while (days.has(d.toDateString())) {
+      n++;
+      d.setDate(d.getDate() - 1);
     }
-    setStories((prev) => [data as Story, ...prev]);
-    setDraft(EMPTY_DRAFT);
-    setShowDetails(false);
+    return n;
+  }, [practiceLog, stories]);
+
+  // Practise only Ready stories (STAR 4/4), least practised first
+  const practiceStory = useMemo(() => {
+    const chosen = practiceId ? stories.find((s) => s.id === practiceId) : undefined;
+    if (chosen) return chosen;
+    return stories
+      .filter((s) => starProgress(s) === 4)
+      .sort((a, b) => {
+        const at = a.last_practiced_at ? Date.parse(a.last_practiced_at) : 0;
+        const bt = b.last_practiced_at ? Date.parse(b.last_practiced_at) : 0;
+        return a.practice_count - b.practice_count || at - bt;
+      })[0];
+  }, [stories, practiceId]);
+
+  // After saving: bring the new story into view and highlight it (focus stays in the composer)
+  useEffect(() => {
+    if (!newId) return;
+    const el = document.querySelector(`[data-story-id="${newId}"]`);
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "nearest" });
+  }, [newId]);
+
+  function replaceStory(row: Story) {
+    const story = normalizeStory(row);
+    setStories((prev) => prev.map((s) => (s.id === story.id ? story : s)));
+  }
+
+  // Runs AFTER a story is saved. Never blocks or undoes the save.
+  async function structure(id: string, context?: string) {
+    setStructuring((m) => ({ ...m, [id]: true }));
+    setAiErrors((m) => ({ ...m, [id]: undefined }));
+    try {
+      const res = await fetch("/api/structure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ storyId: id, context }),
+        signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (json.story) replaceStory(json.story as Story);
+      if (!res.ok) setAiErrors((m) => ({ ...m, [id]: (json.error as AiErrorCode) ?? "ai_failed" }));
+    } catch (err) {
+      const timedOut = (err as Error).name === "TimeoutError" || (err as Error).name === "AbortError";
+      setAiErrors((m) => ({ ...m, [id]: timedOut ? "timeout" : "ai_failed" }));
+    } finally {
+      setStructuring((m) => ({ ...m, [id]: false }));
+    }
+  }
+
+  // All mutations return a friendly error message, or null on success,
+  // so each form can show the error next to itself.
+  async function insertStory(fields: Partial<Story>): Promise<[Story | null, string | null]> {
+    let { data, error } = await supabase.from("stories").insert(fields).select().single();
+    // PGRST204 = unknown column: the title column isn't there yet (004 not run) -> save without it
+    if (error?.code === "PGRST204" && "title" in fields) {
+      const { title: _ignored, ...rest } = fields;
+      ({ data, error } = await supabase.from("stories").insert(rest).select().single());
+    }
+    if (error) return [null, friendlyError(error, "We couldn't save your story. Please try again.")];
+    const story = normalizeStory(data as Story);
+    setStories((prev) => [story, ...prev]);
+    setNewId(story.id);
+    return [story, null];
+  }
+
+  async function addStory(draft: StarDraft, draftTags: string[], title = "") {
+    const [story, err] = await insertStory({
+      ...(title ? { title } : {}),
+      description: draft.description.trim(),
+      situation: draft.situation.trim(),
+      task: draft.task.trim(),
+      action: draft.action.trim(),
+      result: draft.result.trim(),
+      tags: draftTags,
+    });
+    if (!story) return err;
+    // Too short for the AI (same rule as the server): show "Too short for AI" right away, skip the call
+    if (!isTooShort(story)) void structure(story.id);
+    return null;
+  }
+
+  async function addFromSuggestion(s: Suggestion) {
+    const [story, err] = await insertStory({ description: s.title, tags: s.tags });
+    if (!story) return err;
+    await supabase.from("story_suggestions").delete().eq("id", s.id);
+    void structure(story.id, s.source_experience);
+    return null;
+  }
+
+  // Story Sparks: the answer becomes a normal story; the question gives the AI context
+  async function addFromSpark(answer: string, sparkTags: string[], question: string) {
+    const [story, err] = await insertStory({ description: answer, tags: sparkTags });
+    if (!story) return err;
+    if (!isTooShort(story)) void structure(story.id, `Interview question this answers: ${question}`);
+    return null;
   }
 
   async function updateStory(id: string, patch: Partial<Story>) {
-    setError(null);
-    const { data, error } = await supabase
-      .from("stories")
-      .update(patch)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) {
-      setError(error.message);
-      return false;
+    let { data, error } = await supabase.from("stories").update(patch).eq("id", id).select().single();
+    if (error?.code === "PGRST204" && "title" in patch) {
+      const { title: _ignored, ...rest } = patch;
+      ({ data, error } = await supabase.from("stories").update(rest).eq("id", id).select().single());
     }
-    setStories((prev) => prev.map((s) => (s.id === id ? (data as Story) : s)));
-    return true;
+    if (error) return friendlyError(error, "We couldn't save your changes. Please try again.");
+    replaceStory(data as Story);
+    return null;
   }
 
   async function deleteStory(id: string) {
-    if (!confirm("Delete this story? This cannot be undone.")) return;
-    setError(null);
     const { error } = await supabase.from("stories").delete().eq("id", id);
-    if (error) {
-      setError(error.message);
-      return;
-    }
+    if (error) return friendlyError(error, "We couldn't delete this story. Please try again.");
     setStories((prev) => prev.filter((s) => s.id !== id));
+    if (practiceId === id) setPracticeId(null);
+    return null;
   }
 
-  function markPracticed(s: Story) {
-    return updateStory(s.id, {
-      practice_count: s.practice_count + 1,
-      last_practiced_at: new Date().toISOString(),
-    });
+  async function markPractised(s: Story) {
+    const now = new Date().toISOString();
+    const err = await updateStory(s.id, { practice_count: s.practice_count + 1, last_practiced_at: now });
+    if (err) return err;
+    // Log it for the streak (ignore a missing table before 004 is run)
+    const { error: logError } = await supabase.from("practice_log").insert({ story_id: s.id, practiced_at: now });
+    if (logError && logError.code !== "PGRST205") console.error("[StoryBank] practice log", logError);
+    setPracticeLog((prev) => [now, ...prev]);
+    setPracticeId(null);
+    return null;
+  }
+
+  function practiseNow(id: string) {
+    setPracticeId(id);
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    requestAnimationFrame(() =>
+      document.getElementById("practice-panel")?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" })
+    );
+  }
+
+  async function addTag(name: string) {
+    const clean = name.trim().replace(/\s+/g, " ").slice(0, 40);
+    if (!clean) return null;
+    if (hasTag(tagNames, clean)) return "You already have this tag.";
+
+    const { data, error } = await supabase
+      .from("tags")
+      .insert({ name: clean })
+      .select("id, name, is_default")
+      .single();
+    if (error) {
+      return error.code === "23505"
+        ? "You already have this tag."
+        : friendlyError(error, "We couldn't add this tag. Please try again.");
+    }
+    setTags((prev) => [...prev, data as Tag]);
+    return null;
+  }
+
+  async function deleteTag(tag: Tag) {
+    const { error } = await supabase.from("tags").delete().eq("id", tag.id);
+    if (error) return friendlyError(error, "We couldn't delete this tag. Please try again.");
+    setTags((prev) => prev.filter((t) => t.id !== tag.id));
+    return null;
   }
 
   return (
-    <div className="container app-grid">
-      <section className="card" aria-labelledby="add-heading">
-        <h1 id="add-heading" className="h2">Add a story</h1>
-        <form onSubmit={addStory} className="stack">
-          <label className="field">
-            <span>Short description</span>
-            <input
-              type="text"
-              required
-              maxLength={500}
-              placeholder="e.g. Led my team's marketing case competition"
-              value={draft.description}
-              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
-              data-testid="core-input"
-            />
-          </label>
+    <TagColorProvider value={tagColors}>
+    <div className="page-wash" aria-hidden="true" />
+    <div className="container app-page">
+      <header className="page-head">
+        <h1 className="h1">Your story bank</h1>
+        {stories.length === 0 && <p className="muted">Start by adding your first story below.</p>}
+      </header>
 
-          <button
-            type="button"
-            className="text-link toggle"
-            aria-expanded={showDetails}
-            onClick={() => setShowDetails((v) => !v)}
-          >
-            {showDetails ? "− Hide STAR details" : "+ Add STAR details & tags (optional)"}
-          </button>
-
-          {showDetails && (
-            <div className="stack">
-              {STAR_FIELDS.map((f) => (
-                <label className="field" key={f.key}>
-                  <span>{f.label}</span>
-                  <textarea
-                    rows={2}
-                    placeholder={f.hint}
-                    value={draft[f.key]}
-                    onChange={(e) => setDraft({ ...draft, [f.key]: e.target.value })}
-                  />
-                </label>
-              ))}
-              <label className="field">
-                <span>Tags</span>
-                <input
-                  type="text"
-                  placeholder="leadership, teamwork, conflict"
-                  value={draft.tagsText}
-                  onChange={(e) => setDraft({ ...draft, tagsText: e.target.value })}
-                />
-                <small className="muted">Separate tags with commas.</small>
-              </label>
-            </div>
-          )}
-
-          <button type="submit" className="btn btn-primary btn-block" disabled={saving} data-testid="core-submit">
-            {saving ? "Saving…" : "Save story"}
-          </button>
-        </form>
-        {error && (
-          <p className="error" role="alert">
-            {error}
-          </p>
-        )}
-      </section>
-
-      {nextToPractice && (
-        <section className="card practice" aria-labelledby="practice-heading">
-          <div className="practice-head">
-            <h2 id="practice-heading" className="h2">Today&apos;s practice</h2>
-            {practicedToday && <span className="badge badge-success">✓ Done today</span>}
-          </div>
-          <PracticeCard key={nextToPractice.id} story={nextToPractice} onPracticed={markPracticed} />
-        </section>
+      {stories.length > 0 && (
+        <StatsBar stories={stories.length} ready={readyCount} emptyTags={emptyTagCount} practised={practisedTotal} />
       )}
+      {stories.length < 3 && <GettingStarted />}
 
-      <section aria-labelledby="list-heading" className="list-section">
-        <div className="list-head">
-          <h2 id="list-heading" className="h2">
-            My stories <span className="muted">({stories.length})</span>
-          </h2>
-        </div>
+      <SectionHeader
+        id="add-story"
+        accent="indigo"
+        icon={<Plus size={18} strokeWidth={2} />}
+        title="Add a story"
+        subtitle="Pick one way to add it."
+      />
+      <NewStory
+        userId={userId}
+        tagNames={tagNames}
+        inputRef={composerRef}
+        initialCv={initialCv}
+        initialSuggestions={initialSuggestions}
+        onAdd={addStory}
+        onAddFromCv={addFromSuggestion}
+        onCreateTag={addTag}
+        onSaveSpark={addFromSpark}
+        option={newOption}
+        onOptionChange={setNewOption}
+      />
 
-        {allTags.length > 0 && (
-          <div className="tag-filter" role="group" aria-label="Filter by tag">
-            <button
-              type="button"
-              className={`chip ${tagFilter === null ? "chip-active" : ""}`}
-              aria-pressed={tagFilter === null}
-              onClick={() => setTagFilter(null)}
-            >
-              All
-            </button>
-            {allTags.map((t) => (
-              <button
-                key={t}
-                type="button"
-                className={`chip ${tagFilter === t ? "chip-active" : ""}`}
-                aria-pressed={tagFilter === t}
-                onClick={() => setTagFilter(tagFilter === t ? null : t)}
-              >
-                #{t}
+      <SectionHeader
+        id="my-stories"
+        accent="teal"
+        icon={<BookOpen size={18} strokeWidth={1.75} />}
+        title={`Your stories (${stories.length})`}
+        subtitle="Click a story to see the full STAR answer."
+        actions={
+          stories.length > 0 && (
+            <div className="segmented" role="group" aria-label="Show stories">
+              <button type="button" aria-pressed={view === "tag"} onClick={() => setView("tag")}>
+                By tag
               </button>
-            ))}
-          </div>
-        )}
+              <button type="button" aria-pressed={view === "all"} onClick={() => setView("all")}>
+                All
+              </button>
+            </div>
+          )
+        }
+      />
+      <StoryGallery
+        view={view}
+        stories={stories}
+        tagNames={tagNames}
+        newId={newId}
+        structuring={structuring}
+        aiErrors={aiErrors}
+        loadError={loadError}
+        onRetry={(id) => structure(id)}
+        onSave={updateStory}
+        onDelete={deleteStory}
+        onPracticeNow={practiseNow}
+        onWriteFirst={() => {
+          setNewOption("write");
+          requestAnimationFrame(() => composerRef.current?.focus());
+        }}
+      />
 
-        {stories.length === 0 ? (
-          <p className="empty card">
-            No stories yet. Add your first one above — even a single line is a great start.
-          </p>
-        ) : (
-          <ul className="story-list">
-            {visible.map((s) => (
-              <StoryItem key={s.id} story={s} onSave={updateStory} onDelete={deleteStory} />
-            ))}
-          </ul>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function PracticeCard({
-  story,
-  onPracticed,
-}: {
-  story: Story;
-  onPracticed: (s: Story) => Promise<boolean>;
-}) {
-  const [revealed, setRevealed] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const filled = STAR_FIELDS.filter((f) => story[f.key].trim() !== "");
-
-  return (
-    <div className="stack">
-      <p className="practice-prompt">
-        Tell this story out loud in under 2 minutes:
-        <strong> {story.description}</strong>
-      </p>
-      {revealed ? (
-        filled.length > 0 ? (
-          <dl className="star">
-            {filled.map((f) => (
-              <div key={f.key}>
-                <dt>{f.label}</dt>
-                <dd>{story[f.key]}</dd>
-              </div>
-            ))}
-          </dl>
-        ) : (
-          <p className="muted">No STAR details yet — add them to make this story stronger.</p>
-        )
-      ) : null}
-      <div className="row">
-        <button type="button" className="btn btn-ghost" onClick={() => setRevealed((v) => !v)}>
-          {revealed ? "Hide notes" : "Show my notes"}
-        </button>
-        <button
-          type="button"
-          className="btn btn-primary"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            await onPracticed(story);
-            setBusy(false);
-          }}
-        >
-          I practiced it ✓
-        </button>
+      <div className="bottom-grid">
+        <div className="bottom-col">
+          <SectionHeader
+            id="practice-panel"
+            accent="rose"
+            icon={<Mic size={18} strokeWidth={1.75} />}
+            title="Practise today"
+            subtitle="Answer one interview question out loud."
+          />
+          <PracticePanel story={practiceStory} practisedToday={practisedToday} streak={streak} onPractised={markPractised} />
+        </div>
+        <div className="bottom-col">
+          <SectionHeader
+            id="your-tags"
+            accent="violet"
+            icon={<TagIcon size={18} strokeWidth={1.75} />}
+            title="Your tags"
+            subtitle="Tags group your stories by topic."
+          />
+          <TagPanel tags={tags} counts={tagCounts} onAdd={addTag} onDelete={deleteTag} />
+        </div>
       </div>
-      <p className="muted small">
-        Practiced {story.practice_count} {story.practice_count === 1 ? "time" : "times"}
-      </p>
+
+      <PrivacyNote />
     </div>
-  );
-}
-
-function StoryItem({
-  story,
-  onSave,
-  onDelete,
-}: {
-  story: Story;
-  onSave: (id: string, patch: Partial<Story>) => Promise<boolean>;
-  onDelete: (id: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState<Draft>({
-    description: story.description,
-    situation: story.situation,
-    task: story.task,
-    action: story.action,
-    result: story.result,
-    tagsText: story.tags.join(", "),
-  });
-  const progress = starProgress(story);
-
-  async function save(e: React.FormEvent) {
-    e.preventDefault();
-    if (!form.description.trim()) return;
-    setBusy(true);
-    const ok = await onSave(story.id, {
-      description: form.description.trim(),
-      situation: form.situation.trim(),
-      task: form.task.trim(),
-      action: form.action.trim(),
-      result: form.result.trim(),
-      tags: parseTags(form.tagsText),
-    });
-    setBusy(false);
-    if (ok) setEditing(false);
-  }
-
-  return (
-    <li className="card story" data-testid="core-item">
-      <div className="story-head">
-        <p className="story-title">{story.description}</p>
-        <span className={`badge ${progress === 4 ? "badge-success" : ""}`} title="STAR sections filled">
-          STAR {progress}/4
-        </span>
-      </div>
-      {story.tags.length > 0 && (
-        <ul className="tags" aria-label="Tags">
-          {story.tags.map((t) => (
-            <li key={t} className="tag">#{t}</li>
-          ))}
-        </ul>
-      )}
-
-      {editing ? (
-        <form onSubmit={save} className="stack edit-form">
-          <label className="field">
-            <span>Short description</span>
-            <input
-              type="text"
-              required
-              maxLength={500}
-              value={form.description}
-              onChange={(e) => setForm({ ...form, description: e.target.value })}
-            />
-          </label>
-          {STAR_FIELDS.map((f) => (
-            <label className="field" key={f.key}>
-              <span>{f.label}</span>
-              <textarea
-                rows={3}
-                placeholder={f.hint}
-                value={form[f.key]}
-                onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
-              />
-            </label>
-          ))}
-          <label className="field">
-            <span>Tags</span>
-            <input
-              type="text"
-              placeholder="leadership, teamwork"
-              value={form.tagsText}
-              onChange={(e) => setForm({ ...form, tagsText: e.target.value })}
-            />
-          </label>
-          <div className="row">
-            <button type="button" className="btn btn-ghost" onClick={() => setEditing(false)}>
-              Cancel
-            </button>
-            <button type="submit" className="btn btn-primary" disabled={busy}>
-              {busy ? "Saving…" : "Save changes"}
-            </button>
-          </div>
-        </form>
-      ) : (
-        <>
-          {open && (
-            <dl className="star">
-              {STAR_FIELDS.map((f) => (
-                <div key={f.key}>
-                  <dt>{f.label}</dt>
-                  <dd className={story[f.key] ? "" : "muted"}>{story[f.key] || "Not written yet"}</dd>
-                </div>
-              ))}
-            </dl>
-          )}
-          <div className="row story-actions">
-            <button type="button" className="text-link" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-              {open ? "Hide details" : "View STAR"}
-            </button>
-            <button type="button" className="text-link" onClick={() => setEditing(true)}>
-              Edit
-            </button>
-            <button type="button" className="text-link danger" onClick={() => onDelete(story.id)}>
-              Delete
-            </button>
-          </div>
-        </>
-      )}
-    </li>
+    </TagColorProvider>
   );
 }

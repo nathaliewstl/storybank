@@ -39,7 +39,8 @@ export async function proxy(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  if (user && (path === "/login" || path === "/signup")) {
+  // Logged-in users have no use for the public landing or auth pages: take them to their stories
+  if (user && (path === "/" || path === "/login" || path === "/signup")) {
     const url = request.nextUrl.clone();
     url.pathname = "/app";
     return NextResponse.redirect(url);
