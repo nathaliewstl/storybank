@@ -1068,9 +1068,6 @@ main { position: relative; }
 @keyframes saved { from { background-color: rgba(var(--primary-rgb), 0.14); } to { background-color: transparent; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.enter { animation: fade-up 0.3s var(--ease) both; }
-.enter-2 { animation-delay: 0.05s; }
-.enter-3 { animation-delay: 0.1s; }
 .spin { animation: spin 1s linear infinite; }
 
 @media (prefers-reduced-motion: reduce) {

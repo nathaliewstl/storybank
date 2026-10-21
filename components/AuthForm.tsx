@@ -46,7 +46,7 @@ export default function AuthForm({ mode }: { mode: Mode }) {
 
   return (
     <div className="auth-wrap">
-      <div className="auth-box enter">
+      <div className="auth-box">
         <BrandMark className="auth-logo" />
         <div className="card auth-card">
           <div className="auth-head">

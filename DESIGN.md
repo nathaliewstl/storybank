@@ -402,12 +402,10 @@ Dependencies: **none** (CSS only). Durations 150–250ms, easing `cubic-bezier(.
 ```css
 :root { --ease: cubic-bezier(.2,.8,.2,1); }
 
-/* No entrance animations on / or /app: content is fully visible on first paint
-   (no opacity 0, so screenshots never capture half-transparent content).
-   .enter is only used on the auth card. Motion is limited to hover / press / expand. */
+/* No entrance animations anywhere (/, /signup, /login, /app): content is fully visible
+   on first paint (no opacity 0, so screenshots never capture half-transparent content).
+   Motion is limited to hover / press / expand. */
 @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-.enter { animation: fade-up .3s var(--ease) both; }
-.enter-2 { animation-delay: .05s; } .enter-3 { animation-delay: .1s; }
 
 /* Things the user opens (STAR fields, story window) may fade in when clicked */
 .star-inputs, .story-dialog[open] { animation: fade-up .2s var(--ease) both; }
