@@ -261,7 +261,7 @@ label.btn.is-disabled { opacity: 0.6; pointer-events: none; }
 .chevron { color: var(--subtle); transition: transform 0.2s var(--ease); }
 [aria-expanded="true"] > .chevron,
 [aria-expanded="true"] .chevron { transform: rotate(180deg); }
-.panel-body { padding: 4px 12px 14px; animation: fade-up 0.2s var(--ease) both; }
+.panel-body { padding: 4px 12px 14px; }
 
 /* ---------------------------------------------------------------- inputs */
 
@@ -594,7 +594,7 @@ button.chip-ai:hover, .chip-ai:hover { border-style: solid; color: var(--ai); bo
 .option-tab.is-ai[aria-selected="true"] { background: var(--ai-soft); border-color: var(--ai); }
 .option-tab.is-ai[aria-selected="true"] .option-title { color: var(--ai); }
 .option-tab.is-ai .option-check { background: var(--ai); color: var(--on-primary); }
-.tab-panel { animation: fade-up 0.2s var(--ease) both; }
+/* No entrance animation: content is fully visible on first paint (and in screenshots) */
 .tab-panel[hidden] { display: none; }
 
 @media (max-width: 479px) {
@@ -703,7 +703,6 @@ button.chip-new:hover { color: var(--primary-hover); border-color: var(--primary
 .story-details {
   padding: 4px 12px 14px 12px;
   display: flex; flex-direction: column; gap: 14px;
-  animation: fade-up 0.2s var(--ease) both;
 }
 .star-grid { display: grid; gap: 12px; }
 .star-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
