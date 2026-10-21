@@ -7,6 +7,10 @@ import type { AiErrorCode } from "@/lib/types";
 export const maxDuration = 60;
 
 const REGENERATE_COOLDOWN_MS = 60_000;
+// A failed CV generation is retried in the background at most this often
+const RETRY_EVERY_MS = 10 * 60_000;
+const MAX_CV_CHARS = 6_000;
+const QUESTION_COUNT = 6;
 
 type SparksResponse = {
   questions: { question: string; source_experience: string; target_tag: string }[];
@@ -17,8 +21,8 @@ const SCHEMA = {
   properties: {
     questions: {
       type: "ARRAY",
-      minItems: 6,
-      maxItems: 10,
+      minItems: QUESTION_COUNT,
+      maxItems: QUESTION_COUNT,
       items: {
         type: "OBJECT",
         properties: {
@@ -42,7 +46,10 @@ function fail(code: AiErrorCode, status: number) {
 }
 
 // POST { action } -> the user's open Story Sparks questions.
-//   "load"        never calls the AI: returns stored questions (built-in ones if there are none yet)
+//   "load"        never calls the AI: returns stored questions (built-in ones if there are none yet).
+//                 If the user has a CV but only built-in questions, it reports retryCv=true when a
+//                 background retry is due (last attempt > 10 minutes ago).
+//   "retry_cv"    the background retry: claims the 10-minute slot, then ONE Gemini call
 //   "cv_uploaded" called once after a CV upload: CV questions from Gemini
 //   "regenerate"  the "New questions" button, at most once per minute
 // If a Gemini call fails (429 / 503 / timeout / invalid), we fall back to built-in questions
@@ -55,12 +62,15 @@ export async function POST(request: Request) {
   if (!user) return fail("unauthorized", 401);
 
   const body = await request.json().catch(() => ({}));
-  const action: "load" | "cv_uploaded" | "regenerate" =
-    body.action === "regenerate" || body.action === "cv_uploaded" ? body.action : "load";
+  const action: "load" | "cv_uploaded" | "regenerate" | "retry_cv" = ["regenerate", "cv_uploaded", "retry_cv"].includes(
+    body.action
+  )
+    ? body.action
+    : "load";
 
   const [{ data: cv }, { data: existing, error: promptsError }, { data: tagRows }, { data: storyRows }] =
     await Promise.all([
-      supabase.from("cv_documents").select("extracted_text").eq("user_id", user.id).maybeSingle(),
+      supabase.from("cv_documents").select("*").eq("user_id", user.id).maybeSingle(),
       supabase.from("story_prompts").select(PROMPT_FIELDS).order("created_at", { ascending: false }),
       supabase.from("tags").select("name"),
       supabase.from("stories").select("tags"),
@@ -73,6 +83,32 @@ export async function POST(request: Request) {
   const prompts = existing ?? [];
   const cvText: string = cv?.extracted_text ?? "";
   const hasCv = cvText.trim().length >= 50;
+  const hasAttemptColumn = !!cv && "sparks_attempt_at" in cv;
+  const newestPrompt = prompts[0]?.created_at ? Date.parse(prompts[0].created_at) : 0;
+  // When was CV generation last tried? (before 005: approximated by the newest stored question)
+  const lastAttempt = hasAttemptColumn
+    ? cv.sparks_attempt_at ? Date.parse(cv.sparks_attempt_at) : 0
+    : newestPrompt;
+  const openCvQuestions = prompts.some((p) => p.status === "open" && p.source_experience);
+  const retryDue = hasCv && !openCvQuestions && Date.now() - lastAttempt >= RETRY_EVERY_MS;
+
+  // Mark "an AI attempt starts now". For retry_cv this is a conditional update, so two tabs
+  // can't both start a retry inside the same 10 minutes.
+  async function claimAttempt(conditional: boolean) {
+    if (!hasAttemptColumn) return !conditional || retryDue;
+    const now = new Date().toISOString();
+    let q = supabase.from("cv_documents").update({ sparks_attempt_at: now }).eq("user_id", user!.id);
+    if (conditional) {
+      const cutoff = new Date(Date.now() - RETRY_EVERY_MS).toISOString();
+      q = q.or(`sparks_attempt_at.is.null,sparks_attempt_at.lt.${cutoff}`);
+    }
+    const { data, error } = await q.select("user_id");
+    if (error) {
+      console.error("[sparks] could not record attempt time", error);
+      return !conditional;
+    }
+    return (data?.length ?? 0) > 0;
+  }
 
   const respond = (list: typeof prompts, aiFallback = false) => {
     const open = list.filter((p) => p.status === "open").sort((a, b) => a.created_at.localeCompare(b.created_at));
@@ -82,6 +118,7 @@ export async function POST(request: Request) {
       // CV questions are the ones with a source experience
       cvQuestions: open.some((p) => p.source_experience),
       aiFallback,
+      retryCv: action === "load" && retryDue,
     });
   };
 
@@ -112,8 +149,14 @@ export async function POST(request: Request) {
 
   // ---- regenerate: once per minute
   if (action === "regenerate") {
-    const newest = prompts[0]?.created_at ? Date.parse(prompts[0].created_at) : 0;
-    if (Date.now() - newest < REGENERATE_COOLDOWN_MS) return fail("too_soon", 429);
+    if (Date.now() - newestPrompt < REGENERATE_COOLDOWN_MS) return fail("too_soon", 429);
+  }
+
+  // ---- background retry: only with a CV, only built-in questions stored, at most every 10 minutes
+  if (action === "retry_cv") {
+    if (!hasCv || openCvQuestions || !(await claimAttempt(true))) return respond(prompts);
+  } else if (hasCv) {
+    await claimAttempt(false);
   }
 
   // ---- regenerate / cv_uploaded without a CV: built-in questions, no AI
@@ -124,13 +167,14 @@ export async function POST(request: Request) {
 
   // ---- with a CV: one Gemini call; on any failure fall back to built-in questions
   const prompt = `You help a student remember stories for job and internship interviews.
-From the CV below, write 6 to 10 short reflective questions in second person ("you").
+From the CV below, write ${QUESTION_COUNT} short reflective questions in second person ("you").
 Rules:
 - 2 to 3 questions per CV experience (job, project, club, volunteering, study).
 - Each question asks about ONE concrete moment and names the experience, e.g. "At Deloitte, was there a moment when the client didn't cooperate? What did you do?"
 - Focus on these tags that have no story yet: ${JSON.stringify(emptyTags)}. Other tags you may use: ${JSON.stringify(tagNames)}.
 - Never invent facts, names, numbers or outcomes that are not in the CV. Ask, don't assume.
 - Max 25 words per question. Write in the CV's language.
+- Return exactly ${QUESTION_COUNT} questions.
 For each question return:
 - question
 - source_experience: the CV experience it is about (role and organisation, max 12 words)
@@ -138,7 +182,7 @@ For each question return:
 
 CV:
 """
-${cvText.slice(0, 12_000)}
+${cvText.slice(0, MAX_CV_CHARS)}
 """`;
 
   let rows: Row[] = [];
@@ -146,7 +190,7 @@ ${cvText.slice(0, 12_000)}
     const ai = await generateJson<SparksResponse>(prompt, SCHEMA, "sparks", { thinking: "minimal" });
     rows = (Array.isArray(ai.questions) ? ai.questions : [])
       .filter((q) => typeof q?.question === "string" && q.question.trim())
-      .slice(0, 10)
+      .slice(0, QUESTION_COUNT)
       .map((q) => ({
         question: q.question.trim().slice(0, 300),
         source_experience: String(q.source_experience ?? "").trim().slice(0, 200) || "Your CV",
@@ -159,6 +203,8 @@ ${cvText.slice(0, 12_000)}
 
   if (rows.length === 0) {
     console.error(`[sparks] AI unavailable (${action}): showing built-in questions instead`);
+    // A failed background retry keeps the built-in questions the user may already be answering
+    if (action === "retry_cv") return respond(prompts, true);
     const saved = await replaceOpen(generic());
     return saved ? respond(saved, true) : fail("ai_failed", 500);
   }

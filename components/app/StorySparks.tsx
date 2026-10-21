@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, CircleAlert, Lock, LoaderCircle, RefreshCw, Sparkles } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { friendlyError } from "@/lib/errors";
@@ -28,6 +28,29 @@ export default function StorySparks({
   const [useTag, setUseTag] = useState(true);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
+  const answerRef = useRef("");
+  answerRef.current = answer;
+
+  // Background retry for CV questions (server allows one per 10 minutes). The built-in questions
+  // stay on screen; the CV questions replace them when they arrive, unless an answer is being typed.
+  async function retryCvInBackground() {
+    try {
+      const res = await fetch("/api/sparks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "retry_cv" }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.cvQuestions || answerRef.current.trim()) return;
+      setPrompts(json.prompts ?? []);
+      setCvQuestions(true);
+      setIndex(0);
+      setUseTag(true);
+    } catch {
+      // Silent: the built-in questions stay; "New questions" is still available
+    }
+  }
 
   async function load(action: "load" | "regenerate") {
     setLoading(true);
@@ -49,6 +72,7 @@ export default function StorySparks({
       setPrompts(json.prompts ?? []);
       setHasCv(!!json.hasCv);
       setCvQuestions(!!json.cvQuestions);
+      if (json.retryCv) void retryCvInBackground();
       setIndex(0);
       setAnswer("");
       setUseTag(true);
@@ -226,7 +250,9 @@ export default function StorySparks({
 
       {/* Exactly one note, matching the questions on screen */}
       {!loading && hasCv && !cvQuestions && total > 0 ? (
-        <p className="small muted">Showing general questions — personalised CV questions will be ready later.</p>
+        <p className="small muted">
+          Personal questions from your CV are being prepared — try &lsquo;New questions&rsquo; in a minute.
+        </p>
       ) : (
         <p className="privacy privacy-inline">
           <Lock size={16} strokeWidth={1.75} aria-hidden="true" />
